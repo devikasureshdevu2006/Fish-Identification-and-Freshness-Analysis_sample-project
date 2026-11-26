@@ -8,6 +8,7 @@ import streamlit as st
 import torch
 import torch.nn as nn
 from torchvision import models, transforms
+import sklearn
 
 try:
     from freshness_features import compute_symptom_scores as _external_symptom_scores
@@ -17,70 +18,125 @@ except Exception:
 st.set_page_config(page_title="Fish Identification & Freshness Analysis", layout="wide")
 
 
+def _clamp_0_100(val: float) -> float:
+    return float(np.clip(val, 0.0, 100.0))
+
+
+def _norm_range(val: float, low: float, high: float) -> float:
+    if high <= low:
+        return 50.0
+    return _clamp_0_100(((val - low) / (high - low)) * 100.0)
+
+
 def analyze_fish_freshness_opencv(img_bgr: np.ndarray) -> dict:
-    """
-    Conservative OpenCV freshness estimator targeting gill redness/clarity,
-    eye clarity/contrast, belly/flesh integrity, and surface sheen without false glare boost.
-    """
-    h, w, _ = img_bgr.shape
-    resized = cv2.resize(img_bgr, (512, 512), interpolation=cv2.INTER_AREA)
+    if img_bgr is None or img_bgr.size == 0:
+        raise ValueError("Invalid image provided to analyze_fish_freshness_opencv")
 
-    hsv = cv2.cvtColor(resized, cv2.COLOR_BGR2HSV).astype(np.float32)
-    lab = cv2.cvtColor(resized, cv2.COLOR_BGR2LAB).astype(np.float32)
-    gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    img = cv2.resize(img_bgr, (224, 224), interpolation=cv2.INTER_AREA)
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype(np.float32)
+    gray_u8 = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray = gray_u8.astype(np.float32)
 
-    hue = hsv[:, :, 0]
+    b_ch = img[:, :, 0].astype(np.float32)
+    g_ch = img[:, :, 1].astype(np.float32)
+    r_ch = img[:, :, 2].astype(np.float32)
+
     sat = hsv[:, :, 1]
     val = hsv[:, :, 2]
 
-    # 1. Surface & Glare check: high brightness/glare on wet/stale skin reduces true freshness score
-    glare_ratio = float(np.mean(val > 215.0))
-    dark_rot_ratio = float(np.mean(val < 45.0))
-    mid_sat = float(np.mean(np.clip((sat / 110.0) * 75.0, 0.0, 80.0)))
-    surface_score = mid_sat - (glare_ratio * 120.0) - (dark_rot_ratio * 110.0)
-    surface_score = float(np.clip(surface_score, 5.0, 85.0))
+    # Ignore white ice background so ice doesn't lower score for fresh fish
+    ice_bg_mask = (val > 185.0) & (sat < 35.0)
+    fg_mask = ~ice_bg_mask
+    fg_ratio = float(np.mean(fg_mask))
 
-    # 2. Gill region proxy (upper-middle / anterior section): bright red hue in HSV (0-12 or 168-180 with decent sat)
-    gill_crop = resized[int(0.15 * 512):int(0.75 * 512), int(0.15 * 512):int(0.85 * 512)]
-    g_hsv = cv2.cvtColor(gill_crop, cv2.COLOR_BGR2HSV).astype(np.float32)
-    red_mask = (((g_hsv[:, :, 0] <= 12.0) | (g_hsv[:, :, 0] >= 168.0)) & (g_hsv[:, :, 1] > 75.0) & (g_hsv[:, :, 2] > 55.0))
-    red_ratio = float(np.mean(red_mask))
-    gill_score = float(np.clip(15.0 + (red_ratio * 320.0) - (dark_rot_ratio * 90.0), 5.0, 90.0))
-    gill_visibility = "Detected" if red_ratio > 0.03 else "Dull / Limited"
+    if fg_ratio > 0.12:
+        fg_sat_mean = float(np.mean(sat[fg_mask]))
+        fg_val_std = float(np.std(val[fg_mask]))
+        # Cool metallic blue/silver tone common in fresh marine fish
+        cool_fresh_ratio = float(np.mean((b_ch[fg_mask] >= r_ch[fg_mask] - 4.0) & (val[fg_mask] > 75.0)))
+        # Warm pinkish/brownish/yellowish discoloration common in stale/cut fish
+        warm_stale_ratio = float(np.mean((r_ch[fg_mask] > b_ch[fg_mask] + 18.0) & (sat[fg_mask] > 25.0)))
+        dark_rot_ratio = float(np.mean(gray[fg_mask] < 50.0))
+    else:
+        fg_sat_mean = float(np.mean(sat))
+        fg_val_std = float(np.std(val))
+        cool_fresh_ratio = float(np.mean((b_ch >= r_ch - 4.0) & (val > 75.0)))
+        warm_stale_ratio = float(np.mean((r_ch > b_ch + 18.0) & (sat > 25.0)))
+        dark_rot_ratio = float(np.mean(gray < 50.0))
 
-    # 3. Eye clarity proxy: local contrast & dark pupil vs cloudy/dull iris
-    eye_crop = gray[int(0.55 * 512):int(0.95 * 512), int(0.40 * 512):int(0.95 * 512)]
-    lap_var = float(cv2.Laplacian(eye_crop, cv2.CV_32F).var())
-    eye_contrast = float(np.std(eye_crop))
-    eye_score = float(np.clip(12.0 + (min(lap_var, 400.0) / 400.0) * 35.0 + (min(eye_contrast, 70.0) / 70.0) * 25.0, 5.0, 85.0))
+    lap_var = float(cv2.Laplacian(gray_u8, cv2.CV_64F).var())
 
-    # 4. Belly & Flesh integrity proxy: penalize strong edges/cuts/tears/cavities inside body region
-    body_edges = cv2.Canny(cv2.GaussianBlur(gray, (5, 5), 0).astype(np.uint8), 60, 150)
-    edge_density = float(np.mean(body_edges > 0))
-    # High edge density from cuts/open cavities/tears lowers integrity score
-    belly_score = float(np.clip(78.0 - (edge_density * 420.0) - (dark_rot_ratio * 100.0), 5.0, 85.0))
-    belly_visibility = "Cut / Irregular" if edge_density > 0.08 else "Intact / Check"
-
-    # Weighted composite favoring conservative freshness estimation
-    composite = (
-        0.30 * gill_score
-        + 0.25 * eye_score
-        + 0.25 * belly_score
-        + 0.20 * surface_score
+    # 1. Surface Freshness (rewards cool metallic sheen; penalizes warm brownish/pinkish spoilage)
+    surface_score = _clamp_0_100(
+        46.0
+        + 0.18 * _norm_range(lap_var, 45.0, 420.0)
+        + 0.18 * _norm_range(fg_val_std, 18.0, 68.0)
+        + cool_fresh_ratio * 24.0
+        - warm_stale_ratio * 34.0
+        - dark_rot_ratio * 90.0
     )
 
-    # Extra penalty if image shows heavy cutting/damage or very low overall saturation
-    if edge_density > 0.09 or float(np.mean(sat)) < 55.0:
-        composite -= 12.0
+    # 2. Eye Condition (clear dark pupil + bright ring = high local contrast & dark-to-bright spread)
+    eye_crop = gray_u8[35:155, 50:200]
+    eye_lap = float(cv2.Laplacian(eye_crop, cv2.CV_64F).var()) if eye_crop.size > 0 else lap_var
+    eye_con = float(np.std(eye_crop)) if eye_crop.size > 0 else fg_val_std
+    eye_score = _clamp_0_100(
+        44.0
+        + 0.28 * _norm_range(eye_lap, 45.0, 450.0)
+        + 0.28 * _norm_range(eye_con, 20.0, 68.0)
+        + cool_fresh_ratio * 10.0
+        - warm_stale_ratio * 22.0
+    )
 
-    composite = round(float(np.clip(composite, 0.0, 95.0)), 1)
+    # 3. Gill Color / Condition
+    bright_red_mask = (r_ch > g_ch + 38.0) & (r_ch > b_ch + 38.0) & (r_ch > 130.0)
+    bright_red_ratio = float(np.mean(bright_red_mask))
+    pale_brown_gill = float(np.mean((r_ch > g_ch + 10.0) & (r_ch <= g_ch + 38.0) & (r_ch < 155.0)))
+    dark_sludge = float(np.mean((r_ch < 65.0) & (g_ch < 65.0) & (b_ch < 65.0)))
+
+    if bright_red_ratio >= 0.015:
+        gill_score = _clamp_0_100(
+            74.0
+            + min(bright_red_ratio * 260.0, 18.0)
+            - dark_sludge * 100.0
+            - pale_brown_gill * 45.0
+        )
+    else:
+        gill_score = _clamp_0_100(
+            72.0
+            + cool_fresh_ratio * 10.0
+            - dark_sludge * 110.0
+            - pale_brown_gill * 42.0
+        )
+
+    # 4. Belly Swelling Check
+    belly_roi = gray[115:215, 35:190]
+    belly_std = float(np.std(belly_roi))
+    belly_dark = float(np.mean(belly_roi < 50.0))
+    belly_score = _clamp_0_100(
+        74.0
+        + cool_fresh_ratio * 8.0
+        - (belly_dark * 110.0)
+        - warm_stale_ratio * 24.0
+        - max(0.0, (belly_std - 62.0) * 0.5)
+    )
+
+    composite = round(
+        _clamp_0_100(
+            0.30 * surface_score
+            + 0.25 * eye_score
+            + 0.25 * gill_score
+            + 0.20 * belly_score
+        ),
+        1,
+    )
 
     return {
         "gill_score": round(gill_score, 1),
-        "gill_visibility": gill_visibility,
+        "gill_visibility": "Detected" if bright_red_ratio >= 0.015 else "Closed / Check",
         "eye_score": round(eye_score, 1),
         "belly_score": round(belly_score, 1),
-        "belly_visibility": belly_visibility,
+        "belly_visibility": "Intact / Normal" if belly_dark < 0.08 else "Check",
         "surface_score": round(surface_score, 1),
         "symptom_composite": composite,
     }
@@ -138,6 +194,7 @@ st.caption("Stack: Python, PyTorch/Torchvision (Deep Learning), OpenCV (cv2), Nu
 
 with st.sidebar:
     st.header("Settings")
+    inspector_email = st.text_input("Inspector Email", value="")
     threshold = st.slider("Freshness Threshold (%)", 50, 95, 70, 1)
     use_external = st.checkbox("Use freshness_features.py if available", value=False)
     species_ckpt = st.text_input("Species Checkpoint", "models/species_model.pth")
@@ -210,8 +267,10 @@ with tab1:
                     f"Symptom Composite: {symptoms['symptom_composite']}%"
                 )
 
+        clean_email = inspector_email.strip() if inspector_email.strip() else "Not Provided"
         row = {
             "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "Email": clean_email,
             "Image": getattr(file, "name", "camera.jpg"),
             "Species": species_name,
             "Freshness_%": freshness_pct,
@@ -226,6 +285,7 @@ with tab1:
             not st.session_state["logs"]
             or st.session_state["logs"][-1]["Image"] != row["Image"]
             or st.session_state["logs"][-1]["Status"] != row["Status"]
+            or st.session_state["logs"][-1]["Email"] != row["Email"]
         ):
             st.session_state["logs"].append(row)
 
